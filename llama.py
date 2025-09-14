@@ -188,7 +188,7 @@ class LlamaLayer(nn.Module):
         https://arxiv.org/pdf/1706.03762.pdf.
 
         The transformer block should consist of:
-        1) layer normalization of the input (via Root Mean Square layer normalization)
+        1) layer normalization of the input 
         2) self-attention on the layer-normalized input
         3) a residual connection (i.e., add the input to the output of the self-attention)
         3) layer normalization on the output of the self-attention
