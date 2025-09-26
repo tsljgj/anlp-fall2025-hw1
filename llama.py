@@ -43,10 +43,13 @@ class LayerNorm(torch.nn.Module):
             torch.Tensor: The normalized tensor.
         """
         # todo
-        mean = x.mean(dim=-1, keepdim=True)
-        var  = x.var(dim=-1, keepdim=True, unbiased=False)
-        xhat = (x - mean) / torch.sqrt(var + self.eps)
+        # LayerNorm across the last dimension:
+        # μ = mean(x), σ = sqrt(mean((x-μ)^2) + eps)
+        mu  = x.mean(dim=-1, keepdim=True)
+        var = torch.var(x, dim=-1, keepdim=True, unbiased=False)  # population variance
+        xhat = (x - mu) / torch.sqrt(var + self.eps)
         return xhat
+
 
     def forward(self, x):
         """
@@ -101,12 +104,8 @@ class Attention(nn.Module):
         bs, nH, T, d = query.shape
 
         # scores: (bs, nH, T, T)
+        # NOTE: No causal mask here—plain scaled dot-product attention.
         scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d)
-
-        # causal mask (prevent attending to future positions)
-        # mask shape (T, T): True where j > i
-        causal = torch.triu(torch.ones(T, T, device=scores.device, dtype=torch.bool), diagonal=1)
-        scores = scores.masked_fill(causal, float('-inf'))
 
         # attention probs with dropout
         att = F.softmax(scores, dim=-1)

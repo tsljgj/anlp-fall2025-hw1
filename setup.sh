@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-conda create -n llama_hw python=3.11
-conda activate llama_hw
+# conda create -n llama_hw python=3.11
+# conda activate llama_hw
 
 # Modify this command depending on your system's environment.
 # As written, this command assumes you have CUDA on your machine, but
