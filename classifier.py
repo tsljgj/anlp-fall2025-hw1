@@ -46,40 +46,118 @@ class LlamaEmbeddingClassifier(torch.nn.Module):
 		self.classifier_head = torch.nn.Linear(self.llama.config.dim, self.num_labels)
 
 	def forward(self, input_ids):
-		'''
-		1) Find the hidden state after the final token of the input sequence
-		2) Apply dropout (self.dropout) to the hidden state at training time to mitigate
-		   overfitting.
-		2) Pass this through the classifier head (self.classifier_head), which will return
-		   logits (unnormalized probabilities) over all classes.
-		3) Take the log-softmax of the logits and return log-probabilities over all classes.
-		'''
-		# todo
-		# Run the LLaMA model to obtain logits and hidden states for each position
-		# Assumes self.llama returns (logits, hidden_states) where hidden_states is [B, T, H]
-		logits, hidden_states = self.llama(input_ids)
+		"""
+		Compute zero-shot label probabilities by *autoregressively* scoring each label string.
+		This avoids information leakage that happens if you score all tokens in one pass
+		with right-padding and no attention mask.
 
-		# Determine the index of the final (last non-PAD) token per sequence.
-		# Prefer config.pad_token_id if available; otherwise, default to taking the last position.
-		pad_token_id = getattr(self.llama.config, "pad_token_id", None)
-		if pad_token_id is None:
-			# No padding info available: take the final position directly
-			final_indices = input_ids.new_full((input_ids.size(0),), input_ids.size(1) - 1)
+		Args:
+			input_ids (LongTensor): [B, T] right-padded input token IDs.
+
+		Returns:
+			logits (FloatTensor): [B, num_labels] log-probabilities over labels.
+		"""
+		device = input_ids.device
+		B, T = input_ids.size()
+
+		# --- 1) Find true lengths to drop PADs from the prefix ---
+		# We try to use tokenizer.pad_id if available; otherwise assume no padding.
+		try:
+			pad_id = self.tokenizer.pad_id
+		except AttributeError:
+			pad_id = None
+
+		if pad_id is not None:
+			# lengths[i] = number of non-pad tokens in input_ids[i]
+			with torch.no_grad():
+				is_not_pad = (input_ids != pad_id)
+				lengths = is_not_pad.long().sum(dim=1)  # [B]
 		else:
-			# Compute lengths = count of non-pad tokens per sequence
-			lengths = (input_ids != pad_token_id).long().sum(dim=1)
-			# Index of the final token is lengths - 1 (clamped to valid range)
-			final_indices = torch.clamp(lengths - 1, min=0)
+			# No PAD id exposed: treat the entire row as valid tokens.
+			lengths = torch.full((B,), T, dtype=torch.long, device=device)
 
-		# Gather the hidden state at the final token for each sequence: shape [B, H]
-		batch_indices = torch.arange(input_ids.size(0), device=input_ids.device)
-		final_hidden = hidden_states[batch_indices, final_indices, :]
+		# --- 2) Build per-example prefixes (trim right padding) ---
+		# We’ll loop over batch items because each prefix can have a different length.
+		# For each example we will score every label autoregressively.
+		num_labels = self.num_labels
+		out = torch.empty((B, num_labels), dtype=torch.float32, device=device)
 
-		# Apply dropout
-		final_hidden = self.dropout(final_hidden)
+		# Small helper to run model and return log-probs at *last* position only.
+		def last_step_logprobs(x_ids: torch.Tensor) -> torch.Tensor:
+			# x_ids: [1, L]
+			logits, _ = self.llama(x_ids)              # [1, L, vocab]
+			last_logits = logits[:, -1, :]             # [1, vocab]
+			return F.log_softmax(last_logits, dim=-1)  # [1, vocab]
 
-		# Classifier head to produce logits over classes: shape [B, num_labels]
-		class_logits = self.classifier_head(final_hidden)
+		for b in range(B):
+			L = int(lengths[b].item())
+			# Guard against empty rows (shouldn't happen, but be safe)
+			L = max(L, 1)
 
-		# Return log-probabilities
-		return F.log_softmax(class_logits, dim=-1)
+			prefix = input_ids[b:b+1, :L]  # shape [1, L] (drop PADs)
+			label_scores = []
+
+			for lbl_idx, lbl_token_ids in enumerate(self.label_name_ids):
+				# Autoregressive sum_{t} log p(y_t | prefix, y_<t)
+				logp_sum = 0.0
+				if len(lbl_token_ids) == 0:
+					# Empty label string — define its score as 0 log-prob (neutral)
+					label_scores.append(torch.tensor(0.0, device=device))
+					continue
+
+				# We’ll iteratively append label tokens and score only the NEXT token.
+				# Keep a small growing buffer on device for this example.
+				ctx = prefix
+				for t, y_t in enumerate(lbl_token_ids):
+					# Compute log p(y_t | ctx)
+					lp = last_step_logprobs(ctx)          # [1, vocab]
+					logp_y_t = lp[0, y_t]
+					logp_sum = logp_sum + logp_y_t
+					# Append this token to context for the next step
+					y_t_tensor = torch.tensor([[y_t]], dtype=ctx.dtype, device=device)
+					ctx = torch.cat([ctx, y_t_tensor], dim=1)
+
+				label_scores.append(logp_sum)
+
+			out[b, :] = torch.stack(label_scores)
+   
+		return out
+
+	# def forward(self, input_ids):
+	# 	'''
+	# 	1) Find the hidden state after the final token of the input sequence
+	# 	2) Apply dropout (self.dropout) to the hidden state at training time to mitigate
+	# 	   overfitting.
+	# 	2) Pass this through the classifier head (self.classifier_head), which will return
+	# 	   logits (unnormalized probabilities) over all classes.
+	# 	3) Take the log-softmax of the logits and return log-probabilities over all classes.
+	# 	'''
+	# 	# todo
+	# 	# Run the LLaMA model to obtain logits and hidden states for each position
+	# 	# Assumes self.llama returns (logits, hidden_states) where hidden_states is [B, T, H]
+	# 	logits, hidden_states = self.llama(input_ids)
+
+	# 	# Determine the index of the final (last non-PAD) token per sequence.
+	# 	# Prefer config.pad_token_id if available; otherwise, default to taking the last position.
+	# 	pad_token_id = getattr(self.llama.config, "pad_token_id", None)
+	# 	if pad_token_id is None:
+	# 		# No padding info available: take the final position directly
+	# 		final_indices = input_ids.new_full((input_ids.size(0),), input_ids.size(1) - 1)
+	# 	else:
+	# 		# Compute lengths = count of non-pad tokens per sequence
+	# 		lengths = (input_ids != pad_token_id).long().sum(dim=1)
+	# 		# Index of the final token is lengths - 1 (clamped to valid range)
+	# 		final_indices = torch.clamp(lengths - 1, min=0)
+
+	# 	# Gather the hidden state at the final token for each sequence: shape [B, H]
+	# 	batch_indices = torch.arange(input_ids.size(0), device=input_ids.device)
+	# 	final_hidden = hidden_states[batch_indices, final_indices, :]
+
+	# 	# Apply dropout
+	# 	final_hidden = self.dropout(final_hidden)
+
+	# 	# Classifier head to produce logits over classes: shape [B, num_labels]
+	# 	class_logits = self.classifier_head(final_hidden)
+
+	# 	# Return log-probabilities
+	# 	return F.log_softmax(class_logits, dim=-1)
