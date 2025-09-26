@@ -61,15 +61,33 @@ def apply_rotary_emb(
     # This separates each query/key vector into its odd and even indices (assuming *one-indexing*).
     # query_real contains q_1, q_3, q_5, ... and query_imag contains q_2, q_4, q_6, ...
 
-    # First, compute the trigonometric values in the second and fourth columns in
-    # slide 49 (linked above).
+    half_dim = head_dim // 2  # number of complex pairs
 
-    # Then, combine these trigonometric values with the tensors query_real, query_imag,
-    # key_real, and key_imag.
+    # inv_freq[i] = theta^(-i/half_dim), where i indexes the complex pairs (i.e., dims 0,2,4,... in the original)
+    inv_freq = 1.0 / (theta ** (torch.arange(0, half_dim, device=device, dtype=torch.float32) / half_dim))
 
-    raise NotImplementedError
+    # positions 0..seqlen-1
+    t = torch.arange(seqlen, device=device, dtype=torch.float32)
 
-    query_out = None
-    key_out = None
-    # Return the rotary position embeddings for the query and key tensors
+    # freqs: (seqlen, half_dim); then get cos/sin
+    freqs = torch.einsum("i,j->ij", t, inv_freq)  # outer product
+    cos = torch.cos(freqs).to(query_real.dtype)   # (S, half_dim)
+    sin = torch.sin(freqs).to(query_real.dtype)
+
+    # Broadcast shapes to match (..., S, ..., half_dim)
+    cos_q = reshape_for_broadcast(cos, query_real)
+    sin_q = reshape_for_broadcast(sin, query_real)
+    cos_k = reshape_for_broadcast(cos,   key_real)
+    sin_k = reshape_for_broadcast(sin,   key_real)
+
+    # Complex multiply: (a + i b) * (cos + i sin) = (a cos - b sin) + i (a sin + b cos)
+    q_rot_real = query_real * cos_q - query_imag * sin_q
+    q_rot_imag = query_real * sin_q + query_imag * cos_q
+    k_rot_real =   key_real * cos_k -   key_imag * sin_k
+    k_rot_imag =   key_real * sin_k +   key_imag * cos_k
+
+    # Pack back to original shapes/dtypes
+    query_out = torch.stack([q_rot_real, q_rot_imag], dim=-1).reshape_as(query).to(query.dtype)
+    key_out   = torch.stack([k_rot_real, k_rot_imag], dim=-1).reshape_as(key).to(key.dtype)
+
     return query_out, key_out

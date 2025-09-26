@@ -33,7 +33,7 @@ class LoRALayer(nn.Module):
         """
         Forward pass through LoRA layer.
         
-        The LoRA forward pass should:
+        The LoRA forward pass should: 
         1. Compute the original layer output
         2. Compute the LoRA path: x -> A -> B -> scale
             2a: Apply Layer A (down-projection)
@@ -48,7 +48,21 @@ class LoRALayer(nn.Module):
             Output tensor of shape (batch, seq, out_features)
         """
         # todo
-        raise NotImplementedError
+        # 1) Original path
+        out_base = self.original_layer(x)
+
+        # 2a) Down-projection with A: (in_features -> rank)
+        #     F.linear uses weight shape (out_features, in_features) and computes x @ W.T
+        down = F.linear(x, self.lora_A)                       # (..., rank)
+
+        # 2b) Up-projection with B: (rank -> out_features)
+        up = F.linear(down, self.lora_B)                      # (..., out_features)
+
+        # 2c) Scale by alpha / rank
+        lora_out = up * self.scaling
+
+        # 3) Residual addition: h = W0 x + (alpha/r) * B A x
+        return out_base + lora_out
 
 
 

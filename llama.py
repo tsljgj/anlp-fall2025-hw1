@@ -43,7 +43,10 @@ class LayerNorm(torch.nn.Module):
             torch.Tensor: The normalized tensor.
         """
         # todo
-        raise NotImplementedError
+        mean = x.mean(dim=-1, keepdim=True)
+        var  = x.var(dim=-1, keepdim=True, unbiased=False)
+        xhat = (x - mean) / torch.sqrt(var + self.eps)
+        return xhat
 
     def forward(self, x):
         """
@@ -94,7 +97,24 @@ class Attention(nn.Module):
         attention matrix before applying it to the value tensor.
         '''
         # todo
-        raise NotImplementedError
+        # query,key,value: (bs, n_local_heads, seqlen, head_dim)
+        bs, nH, T, d = query.shape
+
+        # scores: (bs, nH, T, T)
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d)
+
+        # causal mask (prevent attending to future positions)
+        # mask shape (T, T): True where j > i
+        causal = torch.triu(torch.ones(T, T, device=scores.device, dtype=torch.bool), diagonal=1)
+        scores = scores.masked_fill(causal, float('-inf'))
+
+        # attention probs with dropout
+        att = F.softmax(scores, dim=-1)
+        att = self.attn_dropout(att)
+
+        # output: (bs, nH, T, d)
+        out = torch.matmul(att, value)
+        return out
 
     def forward(
         self,
@@ -197,7 +217,19 @@ class LlamaLayer(nn.Module):
            output of the feed-forward network
         '''
         # todo
-        raise NotImplementedError
+        # 1) LN
+        x_norm = self.attention_norm(x)
+        # 2) self-attn
+        attn_out = self.attention(x_norm)
+        # 3) residual
+        x_res = x + attn_out
+        # 4) LN
+        y_norm = self.ffn_norm(x_res)
+        # 5) FFN
+        ffn_out = self.feed_forward(y_norm)
+        # 6) residual
+        out = x_res + ffn_out
+        return out
 
 class Llama(LlamaPreTrainedModel):
     def __init__(self, config: LlamaConfig):
@@ -273,12 +305,11 @@ class Llama(LlamaPreTrainedModel):
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :] # crop to just the final time step
-            # todo
-            raise NotImplementedError
-            
+        
+            # todo    
             if temperature == 0.0:
                 # select the single most likely index
-                idx_next = None
+                idx_next = torch.argmax(logits, dim=-1, keepdim=True)
             else:
                 '''
                 Perform temperature sampling with epsilon sampling:
@@ -288,7 +319,26 @@ class Llama(LlamaPreTrainedModel):
                 4) Renormalize the filtered probabilities so they sum to 1.
                 5) Sample from this filtered probability distribution.
                 '''
-                idx_next = None
+                # 1) temperature
+                probs = F.softmax(logits / temperature, dim=-1)
+
+                # 2) epsilon mask (keep tokens with prob >= epsilon)
+                if epsilon is not None and epsilon > 0.0:
+                    keep = probs >= epsilon
+                    # zero out filtered tokens
+                    probs = probs * keep
+
+                    # 4) renormalize; if all filtered, fall back to original softmax
+                    sums = probs.sum(dim=-1, keepdim=True)
+                    fallback = (sums == 0)
+                    if fallback.any():
+                        probs[fallback.squeeze(-1)] = F.softmax(logits[fallback.squeeze(-1)] / temperature, dim=-1)
+                    else:
+                        probs = probs / sums
+
+                # 5) sample
+                idx_next = torch.multinomial(probs, num_samples=1)
+                
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
         
